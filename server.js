@@ -1,31 +1,22 @@
 const express = require("express");
 const scrape = require("./working");
-const app = express();
 
+const app = express();
 app.use(express.json());
 
 app.post("/scrape", async (req, res) => {
   try {
-    const { url } = req.body;
-    
-    // Validate URL exists
-    if (!url) {
-      return res.status(400).json({ error: "URL is required" });
-    }
-    
-    // Call scraper with just the URL
-    const result = await scrape({ url });
+    const { url, longDesc } = req.body;
+    const result = await scrape({ url, longDesc });
     res.json(result);
-    
   } catch (err) {
-    console.error("Scraping error:", err);
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
 app.get("/health", (_, res) => res.send("OK"));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Puppeteer service running on port ${PORT}`);
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Puppeteer service running");
 });
