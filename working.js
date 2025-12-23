@@ -1,15 +1,29 @@
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+
 puppeteer.use(StealthPlugin());
-const browser = await puppeteer.launch({
-  headless: "new",
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-blink-features=AutomationControlled'
-  ]
-});
+
+let browser;
+
+async function initBrowser() {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled'
+      ]
+    });
+  }
+  return browser;
+}
+
+module.exports = {
+  initBrowser
+};
+
 
 // Global timeout for the entire script (2 minutes max)
 const SCRIPT_TIMEOUT = 120000;
@@ -604,5 +618,6 @@ async function scrapeWithRetry(url, longDesc, retries = 3, delay = 3000) {
 module.exports = async function scrapeHandler({ url, longDesc }) {
   return await scrapeWithRetry(url, longDesc);
 };
+
 
 
