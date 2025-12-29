@@ -4,9 +4,11 @@ const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 puppeteer.use(StealthPlugin());
 
 let browser;
+let pagePool = [];
+const MAX_POOL_SIZE = 3;
 
 /* =========================
-   BROWSER SINGLETON
+   BROWSER SINGLETON WITH PAGE POOL
 ========================= */
 async function getBrowser() {
   if (browser) return browser;
@@ -19,21 +21,50 @@ async function getBrowser() {
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--disable-blink-features=AutomationControlled",
-      "--window-size=1920,1080"
+      "--window-size=1920,1080",
+      "--disable-web-security",
+      "--disable-features=IsolateOrigins,site-per-process"
     ]
   });
 
   return browser;
 }
 
+async function getPageFromPool() {
+  if (pagePool.length > 0) {
+    return pagePool.pop();
+  }
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  await setupPage(page);
+  return page;
+}
+
+async function returnPageToPool(page) {
+  if (pagePool.length < MAX_POOL_SIZE) {
+    try {
+      await page.goto('about:blank');
+      pagePool.push(page);
+    } catch {
+      try { await page.close(); } catch {}
+    }
+  } else {
+    try { await page.close(); } catch {}
+  }
+}
+
 async function closeBrowser() {
+  pagePool.forEach(page => {
+    try { page.close(); } catch {}
+  });
+  pagePool = [];
+  
   if (browser) {
     try { await browser.close(); } catch {}
     browser = null;
   }
 }
 
-// Clean shutdown handlers
 process.on("SIGTERM", closeBrowser);
 process.on("SIGINT", closeBrowser);
 
@@ -76,37 +107,34 @@ async function detectBlocks(page) {
 
     return blockInfo.hasContent;
   } catch (err) {
-    console.error(`Block detection error: ${err.message}`);
+    if (err.message.includes("CAPTCHA") || err.message.includes("Cloudflare") || err.message.includes("blocked")) {
+      throw err;
+    }
     return false;
   }
 }
 
 /* =========================
-   SAFE REQUEST INTERCEPTION
+   OPTIMIZED REQUEST INTERCEPTION
 ========================= */
 async function setupRequestInterception(page) {
+  const blockedResources = new Set(['image', 'stylesheet', 'font', 'media', 'texttrack', 'object', 'beacon', 'csp_report', 'imageset']);
+  
   try {
     await page.setRequestInterception(true);
     
     page.on('request', req => {
-      try {
-        const resourceType = req.resourceType();
-        if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-          req.abort().catch(() => {});
-        } else {
-          req.continue().catch(() => {});
-        }
-      } catch (err) {
-        // Request already handled, ignore
+      if (blockedResources.has(req.resourceType())) {
+        req.abort().catch(() => {});
+      } else {
+        req.continue().catch(() => {});
       }
     });
-  } catch (err) {
-    console.error(`Request interception setup error: ${err.message}`);
-  }
+  } catch {}
 }
 
 /* =========================
-   RANDOM USER AGENT
+   PAGE SETUP
 ========================= */
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
@@ -118,6 +146,19 @@ const USER_AGENTS = [
 
 function getRandomUserAgent() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+async function setupPage(page) {
+  await page.setUserAgent(getRandomUserAgent());
+  await page.setDefaultNavigationTimeout(30000);
+  await page.setDefaultTimeout(30000);
+  await setupRequestInterception(page);
+  
+  // Optimize page performance
+  await page.setViewport({ width: 1920, height: 1080 });
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
 }
 
 function extractPackQty(text) {
@@ -153,20 +194,16 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
 
     const fullVariantText = `${cleanVariant} ${cleanVariantShade}`;
 
-    console.error(`    [DEBUG] Variant Full Text: "${fullVariantText.substring(0, 80)}"`);
-
     // PRODUCT TYPE CHECK: Mini vs Regular products must match
     const mainIsMini = cleanMain.includes('mini');
     const variantIsMini = fullVariantText.includes('mini');
     if (mainIsMini !== variantIsMini) {
-        console.error(`    Rejected: Product type mismatch - main is ${mainIsMini ? 'mini' : 'regular'}, variant is ${variantIsMini ? 'mini' : 'regular'}`);
         return false;
     }
 
     // --- EXACT PHRASE MATCHING FOR COLORS/SHADES ---
     const extractColorPhrase = (text) => {
         const phrases = [];
-
         const shadeWithNumPattern = /\b([a-z]+\/[a-z]+)\s*-?\s*(\d{3})\b/gi;
         let match;
         while ((match = shadeWithNumPattern.exec(text)) !== null) {
@@ -193,9 +230,7 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
             'count', 'pack', 'pcs', 'ounce', 'oz', 'fl oz', 'metric'
         ];
 
-        return phrases.filter(p => {
-            return !ignoredTerms.some(term => p.includes(term));
-        });
+        return phrases.filter(p => !ignoredTerms.some(term => p.includes(term)));
     };
 
     let refColorPhrases = extractColorPhrase(cleanLongDesc);
@@ -204,24 +239,13 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
 
     const varColorPhrases = extractColorPhrase(fullVariantText);
 
-    console.error(`    [DEBUG] RefColorPhrases: [${refColorPhrases}]`);
-    console.error(`    [DEBUG] VarColorPhrases: [${varColorPhrases}]`);
-    console.error(`    [DEBUG] FullVariantText: "${fullVariantText.substring(0, 100)}..."`);
-
     if (refColorPhrases.length > 0) {
-        if (varColorPhrases.length === 0) {
-            console.error(`    Rejected: Ref requires specific shade [${refColorPhrases}], variant has NO shade info`);
-            return false;
-        }
+        if (varColorPhrases.length === 0) return false;
 
         const refCompounds = refColorPhrases.filter(p => p.includes('/'));
         const refSingles = refColorPhrases.filter(p => !p.includes('/'));
-
         const varCompounds = varColorPhrases.filter(p => p.includes('/'));
         const varSingles = varColorPhrases.filter(p => !p.includes('/'));
-
-        console.error(`    [DEBUG] RefCompounds: [${refCompounds}] | VarCompounds: [${varCompounds}]`);
-        console.error(`    [DEBUG] RefSingles: [${refSingles}] | VarSingles: [${varSingles}]`);
 
         if (refCompounds.length > 0) {
             let foundMatch = false;
@@ -231,45 +255,29 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
                     break;
                 }
             }
-
-            if (!foundMatch) {
-                console.error(`    Rejected: Required compound shade [${refCompounds}] not found in variant compounds [${varCompounds}]`);
-                return false;
-            }
-
-            console.error(`    ✓ Exact compound shade match confirmed`);
+            if (!foundMatch) return false;
         }
 
         if (refCompounds.length === 0 && refSingles.length > 0) {
             for (const refSingle of refSingles) {
-                if (!varSingles.includes(refSingle)) {
-                    console.error(`    Rejected: Required single shade "${refSingle}" not found in variant singles [${varSingles}]`);
-                    return false;
-                }
+                if (!varSingles.includes(refSingle)) return false;
             }
-            console.error(`    ✓ Exact single shade match confirmed`);
         }
     }
 
-    // --- SCENTS ---
-    const scentWords = [
-        'lavender', 'vanilla', 'lemon', 'citrus', 'unscented', 'fresh', 'rose', 'ocean',
+    // --- SCENTS, SHAPES, SIZES ---
+    const scentWords = ['lavender', 'vanilla', 'lemon', 'citrus', 'unscented', 'fresh', 'rose', 'ocean',
         'coconut', 'mint', 'eucalyptus', 'floral', 'linen', 'berry', 'pine', 'apple',
-        'cucumber', 'melon', 'sandalwood', 'jasmine', 'chamomile'
-    ];
-
+        'cucumber', 'melon', 'sandalwood', 'jasmine', 'chamomile'];
     const shapes = ['star', 'flower', 'round', 'square', 'oval', 'heart', 'hex', 'rectangle', 'diamond', 'triangle'];
 
     const extractItems = (text, list) => list.filter(i => text.includes(i));
     const extractSizes = (text) => {
         const sizes = [];
         const sizePatterns = [
-            /(\d+\.?\d*)\s*(inch|in|")/gi,
-            /(\d+\.?\d*)\s*(oz|ounce)/gi,
-            /(\d+\.?\d*)\s*(qt|quart)/gi,
-            /(\d+\.?\d*)\s*(l|liter)/gi,
-            /(\d+\.?\d*)\s*(cup)/gi,
-            /(\d+\.?\d*)\s*(piece|pc|pcs)/gi
+            /(\d+\.?\d*)\s*(inch|in|")/gi, /(\d+\.?\d*)\s*(oz|ounce)/gi,
+            /(\d+\.?\d*)\s*(qt|quart)/gi, /(\d+\.?\d*)\s*(l|liter)/gi,
+            /(\d+\.?\d*)\s*(cup)/gi, /(\d+\.?\d*)\s*(piece|pc|pcs)/gi
         ];
         for (const pattern of sizePatterns) {
             let match;
@@ -281,10 +289,8 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
 
     let refScents = extractItems(cleanLongDesc, scentWords);
     if (refScents.length === 0) refScents = extractItems(cleanMain, scentWords);
-
     let refShapes = extractItems(cleanLongDesc, shapes);
     if (refShapes.length === 0) refShapes = extractItems(cleanMain, shapes);
-
     let refSizes = extractSizes(cleanLongDesc);
     if (refSizes.length === 0) refSizes = extractSizes(cleanMain);
 
@@ -292,31 +298,14 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
     const varShapes = extractItems(fullVariantText, shapes);
     const varSizes = extractSizes(fullVariantText);
 
-    console.error(`    [DEBUG] RefScents: [${refScents}] | VarScents: [${varScents}]`);
-    console.error(`    [DEBUG] RefShapes: [${refShapes}] | VarShapes: [${varShapes}]`);
-    console.error(`    [DEBUG] RefSizes:  [${refSizes}]  | VarSizes:  [${varSizes}]`);
-
     const areAttributesEqual = (ref, varList) => {
         if (ref.length === 0) return true;
         if (varList.length === 0) return false;
-        const r = [...ref].sort().join('|');
-        const v = [...varList].sort().join('|');
-        return r === v;
+        return [...ref].sort().join('|') === [...varList].sort().join('|');
     };
 
-    if (refScents.length > 0) {
-        if (!areAttributesEqual(refScents, varScents)) {
-            console.error(`    Rejected: Scent mismatch - Ref [${refScents}], Var [${varScents}]`);
-            return false;
-        }
-    }
-
-    if (refShapes.length > 0) {
-        if (!areAttributesEqual(refShapes, varShapes)) {
-            console.error(`    Rejected: Shape mismatch - Ref [${refShapes}], Var [${varShapes}]`);
-            return false;
-        }
-    }
+    if (refScents.length > 0 && !areAttributesEqual(refScents, varScents)) return false;
+    if (refShapes.length > 0 && !areAttributesEqual(refShapes, varShapes)) return false;
 
     const extractIntegers = (text) => (text.match(/\b\d+\b/g) || []).map(Number);
     const filterMeaningfulNumbers = (text, sizes, packQty, colorPhrases) => {
@@ -324,41 +313,21 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
         if (packQty) nums = nums.filter(n => n !== packQty);
         const sizeNums = sizes.map(s => parseFloat(s));
         nums = nums.filter(n => !sizeNums.includes(n));
-
         for (const phrase of colorPhrases) {
             const phraseNums = phrase.match(/\b\d+\b/g) || [];
-            phraseNums.forEach(pn => {
-                nums = nums.filter(n => n !== parseInt(pn, 10));
-            });
+            phraseNums.forEach(pn => nums = nums.filter(n => n !== parseInt(pn, 10)));
         }
-
         return nums;
     };
 
     const refPackQty = extractPackQty(cleanLongDesc) || extractPackQty(cleanMain) || 1;
     const varPackQty = extractPackQty(fullVariantText) || 1;
-
     let refNums = filterMeaningfulNumbers(cleanLongDesc, refSizes, refPackQty, refColorPhrases);
     if (refNums.length === 0) refNums = filterMeaningfulNumbers(cleanMain, refSizes, refPackQty, refColorPhrases);
-
     const varNums = filterMeaningfulNumbers(fullVariantText, varSizes, varPackQty, varColorPhrases);
 
-    console.error(`    [DEBUG] RefNums: [${refNums}] | VarNums: [${varNums}]`);
-
-    if (refNums.length > 0) {
-        const missingNum = refNums.find(n => !varNums.includes(n));
-        if (missingNum) {
-            console.error(`    Rejected: Model Number mismatch - Ref required [${missingNum}], Var has [${varNums}]`);
-            return false;
-        }
-    }
-
-    if (refSizes.length > 0) {
-        if (!areAttributesEqual(refSizes, varSizes)) {
-            console.error(`    Rejected: Size mismatch - Ref [${refSizes}], Var [${varSizes}]`);
-            return false;
-        }
-    }
+    if (refNums.length > 0 && refNums.find(n => !varNums.includes(n))) return false;
+    if (refSizes.length > 0 && !areAttributesEqual(refSizes, varSizes)) return false;
 
     const productTypes = [
         'spoon', 'spatula', 'turner', 'ladle', 'whisk', 'tongs', 'fork',
@@ -376,13 +345,7 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
 
     if (longDescProducts.length > 0) {
         const intersection = longDescProducts.filter(p => variantProducts.includes(p));
-        const matchRatio = intersection.length / longDescProducts.length;
-
-        if (matchRatio < 0.5) {
-            console.error(`    Rejected: Product type mismatch - LongDesc requires [${longDescProducts}], variant has [${variantProducts}]`);
-            return false;
-        }
-        console.error(`    Product type match OK (${(matchRatio * 100).toFixed(0)}%)`);
+        if (intersection.length / longDescProducts.length < 0.5) return false;
     }
 
     const ignore = ['the', 'and', 'for', 'with', 'of', 'in', 'to', 'see', 'available', 'options',
@@ -393,37 +356,21 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
     const matchWords = matchSource.split(' ').filter(w => w.length > 2 && !allIgnore.includes(w)).slice(0, 6);
     const matchCount = matchWords.filter(w => fullVariantText.includes(w)).length;
 
-    const matched = matchWords.length === 0 || matchCount / matchWords.length >= 0.6;
-    if (!matched) {
-        console.error(`    Rejected: Brand mismatch - only ${matchCount}/${matchWords.length} keywords matched`);
-    } else {
-        console.error(`    ✓ Accepted: Product, shade, and brand match OK`);
-    }
-    return matched;
+    return matchWords.length === 0 || matchCount / matchWords.length >= 0.6;
 }
 
 async function run(url, longDesc) {
     console.error(`Starting scrape for: ${url.substring(0, 80)}...`);
 
-    const browser = await getBrowser();
-    const page = await browser.newPage();
-    
-    const ua = getRandomUserAgent();
-    await page.setUserAgent(ua);
-    console.error(`Using User-Agent: ${ua}`);
-    
-    // INCREASED TIMEOUTS
-    await page.setDefaultNavigationTimeout(60000);
-    await setupRequestInterception(page);
+    const page = await getPageFromPool();
 
     try {
         console.error("Loading main page...");
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
         
-        // Wait for content to load
-        await sleep(3000);
+        // Shorter wait - just enough for content
+        await sleep(1500);
         
-        // Check for blocks/captchas
         const hasContent = await detectBlocks(page);
         if (!hasContent) {
             throw new Error("Page loaded but no product content found");
@@ -456,7 +403,6 @@ async function run(url, longDesc) {
 
             document.querySelectorAll("script").forEach(s => {
                 const text = s.textContent || "";
-
                 const dvMatch = text.match(/dimensionValuesDisplayData[^{]*(\{[^}]+\})/);
                 if (dvMatch) {
                     const asins = dvMatch[1].match(/[A-Z0-9]{10}/g) || [];
@@ -467,7 +413,6 @@ async function run(url, longDesc) {
                         }
                     });
                 }
-
                 const avMatch = text.match(/asinVariationValues[^{]*(\{[^}]+\})/);
                 if (avMatch) {
                     const asins = avMatch[1].match(/[A-Z0-9]{10}/g) || [];
@@ -510,7 +455,6 @@ async function run(url, longDesc) {
                 const text = selected.textContent?.trim() || "";
                 if (text && text !== "Select") return text;
             }
-
             return "";
         });
 
@@ -524,35 +468,31 @@ async function run(url, longDesc) {
             notes: "Main product"
         });
 
-        console.error(`Main: ${data.mainAsin} | Title: ${data.mainTitle.substring(0, 50)}... | Shade: ${mainShade}`);
+        console.error(`Main: ${data.mainAsin} | Shade: ${mainShade}`);
         console.error(`Found ${data.allVariants.length} potential variants to check`);
 
         const checkVariant = async (v) => {
             if (v.asin === data.mainAsin || seenAsins.has(v.asin)) return null;
             seenAsins.add(v.asin);
 
-            const p = await browser.newPage();
-            await p.setDefaultNavigationTimeout(45000); // INCREASED TIMEOUT
-            await setupRequestInterception(p);
+            const p = await getPageFromPool();
 
             try {
                 await p.goto(`https://www.amazon.com/dp/${v.asin}`, { 
                     waitUntil: "domcontentloaded", 
-                    timeout: 45000 
+                    timeout: 25000 
                 });
 
-                await sleep(2000); // Wait for page to stabilize
+                await sleep(1000);
 
-                // Check for blocks on variant pages too
                 const hasContent = await detectBlocks(p);
                 if (!hasContent) {
-                    await p.close();
+                    await returnPageToPool(p);
                     return null;
                 }
 
                 const pageData = await p.evaluate(() => {
                     const title = document.querySelector("#productTitle")?.textContent?.trim() || "";
-
                     let shade = "";
                     const colorRow = document.querySelector('tr.po-color, .po-color_name');
                     if (colorRow) {
@@ -584,11 +524,10 @@ async function run(url, longDesc) {
                             if (text && text !== "Select") shade = text;
                         }
                     }
-
                     return { title, shade };
                 });
 
-                await p.close();
+                await returnPageToPool(p);
 
                 if (!pageData.title) return null;
 
@@ -597,42 +536,45 @@ async function run(url, longDesc) {
                     finalShade = v.label;
                 }
 
-                console.error(`  Checking: ${v.asin} - "${pageData.title.substring(0, 30)}..." Shade: "${finalShade}"`);
-
                 if (!isMatchingProduct(data.mainTitle, mainShade, pageData.title, finalShade, longDesc)) return null;
 
                 const packQty = extractPackQty(pageData.title) || 1;
                 return { asin: v.asin, title: pageData.title, shade: finalShade, packQty };
             } catch (err) {
-                try { await p.close(); } catch { }
+                await returnPageToPool(p);
                 console.error(`  Error checking ${v.asin}: ${err.message}`);
                 return null;
             }
         };
 
-        // PROCESS VARIANTS ONE AT A TIME WITH DELAYS (avoid detection)
-        for (let i = 0; i < data.allVariants.length; i++) {
-            const v = data.allVariants[i];
-            const result = await checkVariant(v);
+        // PARALLEL PROCESSING WITH CONCURRENCY LIMIT
+        const BATCH_SIZE = 3;
+        for (let i = 0; i < data.allVariants.length; i += BATCH_SIZE) {
+            const batch = data.allVariants.slice(i, i + BATCH_SIZE);
+            const batchResults = await Promise.all(batch.map(checkVariant));
             
-            if (result) {
-                results.push({
-                    asin: result.asin,
-                    title: result.title,
-                    shade: result.shade,
-                    url: "https://www.amazon.com/dp/" + result.asin,
-                    packQty: result.packQty,
-                    isMain: false,
-                    notes: "Variant"
-                });
-                console.error(`  ✓ Added: ${result.asin} - Shade: ${result.shade}`);
+            batchResults.forEach(r => {
+                if (r) {
+                    results.push({
+                        asin: r.asin,
+                        title: r.title,
+                        shade: r.shade,
+                        url: "https://www.amazon.com/dp/" + r.asin,
+                        packQty: r.packQty,
+                        isMain: false,
+                        notes: "Variant"
+                    });
+                    console.error(`  ✓ Added: ${r.asin} - Shade: ${r.shade}`);
+                }
+            });
+            
+            // Shorter delay between batches
+            if (i + BATCH_SIZE < data.allVariants.length) {
+                await sleep(800 + Math.random() * 400); // 0.8-1.2 seconds
             }
-            
-            // RATE LIMITING: Wait between requests
-            await sleep(2000 + Math.random() * 1000); // 2-3 seconds
         }
 
-        await page.close();
+        await returnPageToPool(page);
 
         const uniqueResults = [];
         const finalSeenAsins = new Set();
@@ -648,7 +590,7 @@ async function run(url, longDesc) {
         return uniqueResults;
 
     } catch (err) {
-        await page.close();
+        await returnPageToPool(page);
         throw err;
     }
 }
@@ -660,7 +602,6 @@ async function scrapeWithRetry(url, longDesc, retries = 3) {
     } catch (e) {
       console.error(`Attempt ${i} failed: ${e.message}`);
       
-      // If CAPTCHA/blocked, close browser to reset for next attempt
       if (e.message.includes("CAPTCHA") || e.message.includes("blocked") || e.message.includes("Cloudflare")) {
         console.error("⚠️ Detection triggered - closing browser for clean retry");
         await closeBrowser();
@@ -671,8 +612,7 @@ async function scrapeWithRetry(url, longDesc, retries = 3) {
         throw new Error(`All scraping attempts failed: ${e.message}`);
       }
       
-      // Exponential backoff for retries
-      const delay = 5000 * i;
+      const delay = 4000 * i;
       console.error(`Waiting ${delay}ms before retry...`);
       await sleep(delay);
     }
