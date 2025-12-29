@@ -18,7 +18,8 @@ async function getBrowser() {
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--disable-blink-features=AutomationControlled"
+      "--disable-blink-features=AutomationControlled",
+      "--window-size=1920,1080"
     ]
   });
 
@@ -42,54 +43,66 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
    CAPTCHA / BLOCK DETECTION
 ========================= */
 async function detectBlocks(page) {
-  const blockInfo = await page.evaluate(() => {
-    const bodyText = document.body.innerText.toLowerCase();
-    const title = document.title.toLowerCase();
+  try {
+    const blockInfo = await page.evaluate(() => {
+      const bodyText = document.body.innerText.toLowerCase();
+      const title = document.title.toLowerCase();
+      
+      return {
+        isCaptcha: bodyText.includes("enter the characters") || 
+                   title.includes("captcha") ||
+                   bodyText.includes("type the characters"),
+        isCloudflare: bodyText.includes("checking your browser") ||
+                      bodyText.includes("cloudflare") ||
+                      title.includes("just a moment"),
+        isBlocked: bodyText.includes("sorry, we just need to make sure") ||
+                   bodyText.includes("robot") ||
+                   bodyText.includes("automated access"),
+        hasContent: !!document.querySelector("#productTitle")
+      };
+    });
+
+    if (blockInfo.isCaptcha) {
+      throw new Error("❌ Amazon CAPTCHA detected - request blocked");
+    }
     
-    return {
-      isCaptcha: bodyText.includes("enter the characters") || 
-                 title.includes("captcha") ||
-                 bodyText.includes("type the characters"),
-      isCloudflare: bodyText.includes("checking your browser") ||
-                    bodyText.includes("cloudflare") ||
-                    title.includes("just a moment"),
-      isBlocked: bodyText.includes("sorry, we just need to make sure") ||
-                 bodyText.includes("robot") ||
-                 bodyText.includes("automated access"),
-      hasContent: !!document.querySelector("#productTitle")
-    };
-  });
+    if (blockInfo.isCloudflare) {
+      throw new Error("❌ Cloudflare challenge detected - waiting for bypass");
+    }
+    
+    if (blockInfo.isBlocked && !blockInfo.hasContent) {
+      throw new Error("❌ Amazon bot detection triggered - IP flagged");
+    }
 
-  if (blockInfo.isCaptcha) {
-    throw new Error("❌ Amazon CAPTCHA detected - request blocked");
+    return blockInfo.hasContent;
+  } catch (err) {
+    console.error(`Block detection error: ${err.message}`);
+    return false;
   }
-  
-  if (blockInfo.isCloudflare) {
-    throw new Error("❌ Cloudflare challenge detected - waiting for bypass");
-  }
-  
-  if (blockInfo.isBlocked && !blockInfo.hasContent) {
-    throw new Error("❌ Amazon bot detection triggered - IP flagged");
-  }
-
-  return blockInfo.hasContent;
 }
 
 /* =========================
    SAFE REQUEST INTERCEPTION
 ========================= */
-function setupRequestInterception(page) {
-  page.on('request', req => {
-    try {
-      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-        req.abort();
-      } else {
-        req.continue();
+async function setupRequestInterception(page) {
+  try {
+    await page.setRequestInterception(true);
+    
+    page.on('request', req => {
+      try {
+        const resourceType = req.resourceType();
+        if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+          req.abort().catch(() => {});
+        } else {
+          req.continue().catch(() => {});
+        }
+      } catch (err) {
+        // Request already handled, ignore
       }
-    } catch (err) {
-      // Silently handle interception errors to prevent crashes
-    }
-  });
+    });
+  } catch (err) {
+    console.error(`Request interception setup error: ${err.message}`);
+  }
 }
 
 /* =========================
@@ -193,6 +206,7 @@ function isMatchingProduct(mainTitle, mainShade, variantTitle, variantShade, lon
 
     console.error(`    [DEBUG] RefColorPhrases: [${refColorPhrases}]`);
     console.error(`    [DEBUG] VarColorPhrases: [${varColorPhrases}]`);
+    console.error(`    [DEBUG] FullVariantText: "${fullVariantText.substring(0, 100)}..."`);
 
     if (refColorPhrases.length > 0) {
         if (varColorPhrases.length === 0) {
@@ -398,21 +412,22 @@ async function run(url, longDesc) {
     await page.setUserAgent(ua);
     console.error(`Using User-Agent: ${ua}`);
     
-    await page.setDefaultNavigationTimeout(45000);
-    await page.setRequestInterception(true);
-    setupRequestInterception(page);
+    // INCREASED TIMEOUTS
+    await page.setDefaultNavigationTimeout(60000);
+    await setupRequestInterception(page);
 
     try {
         console.error("Loading main page...");
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+        
+        // Wait for content to load
+        await sleep(3000);
         
         // Check for blocks/captchas
         const hasContent = await detectBlocks(page);
         if (!hasContent) {
             throw new Error("Page loaded but no product content found");
         }
-
-        await sleep(2000);
 
         console.error("Extracting variants from page...");
         const data = await page.evaluate(() => {
@@ -509,7 +524,7 @@ async function run(url, longDesc) {
             notes: "Main product"
         });
 
-        console.error(`Main: ${data.mainAsin} | Shade: ${mainShade}`);
+        console.error(`Main: ${data.mainAsin} | Title: ${data.mainTitle.substring(0, 50)}... | Shade: ${mainShade}`);
         console.error(`Found ${data.allVariants.length} potential variants to check`);
 
         const checkVariant = async (v) => {
@@ -517,18 +532,23 @@ async function run(url, longDesc) {
             seenAsins.add(v.asin);
 
             const p = await browser.newPage();
-            await p.setDefaultNavigationTimeout(25000);
-            await p.setRequestInterception(true);
-            setupRequestInterception(p);
+            await p.setDefaultNavigationTimeout(45000); // INCREASED TIMEOUT
+            await setupRequestInterception(p);
 
             try {
                 await p.goto(`https://www.amazon.com/dp/${v.asin}`, { 
                     waitUntil: "domcontentloaded", 
-                    timeout: 25000 
+                    timeout: 45000 
                 });
 
+                await sleep(2000); // Wait for page to stabilize
+
                 // Check for blocks on variant pages too
-                await detectBlocks(p);
+                const hasContent = await detectBlocks(p);
+                if (!hasContent) {
+                    await p.close();
+                    return null;
+                }
 
                 const pageData = await p.evaluate(() => {
                     const title = document.querySelector("#productTitle")?.textContent?.trim() || "";
@@ -577,7 +597,7 @@ async function run(url, longDesc) {
                     finalShade = v.label;
                 }
 
-                console.error(`  Checking: ${v.asin} - Shade: "${finalShade}"`);
+                console.error(`  Checking: ${v.asin} - "${pageData.title.substring(0, 30)}..." Shade: "${finalShade}"`);
 
                 if (!isMatchingProduct(data.mainTitle, mainShade, pageData.title, finalShade, longDesc)) return null;
 
@@ -590,24 +610,26 @@ async function run(url, longDesc) {
             }
         };
 
-        for (let i = 0; i < data.allVariants.length; i += 3) {
-            const batch = data.allVariants.slice(i, i + 3);
-            const batchResults = await Promise.all(batch.map(checkVariant));
-            batchResults.forEach(r => {
-                if (r) {
-                    results.push({
-                        asin: r.asin,
-                        title: r.title,
-                        shade: r.shade,
-                        url: "https://www.amazon.com/dp/" + r.asin,
-                        packQty: r.packQty,
-                        isMain: false,
-                        notes: "Variant"
-                    });
-                    console.error(`  ✓ Added: ${r.asin} - Shade: ${r.shade}`);
-                }
-            });
-            await sleep(700);
+        // PROCESS VARIANTS ONE AT A TIME WITH DELAYS (avoid detection)
+        for (let i = 0; i < data.allVariants.length; i++) {
+            const v = data.allVariants[i];
+            const result = await checkVariant(v);
+            
+            if (result) {
+                results.push({
+                    asin: result.asin,
+                    title: result.title,
+                    shade: result.shade,
+                    url: "https://www.amazon.com/dp/" + result.asin,
+                    packQty: result.packQty,
+                    isMain: false,
+                    notes: "Variant"
+                });
+                console.error(`  ✓ Added: ${result.asin} - Shade: ${result.shade}`);
+            }
+            
+            // RATE LIMITING: Wait between requests
+            await sleep(2000 + Math.random() * 1000); // 2-3 seconds
         }
 
         await page.close();
@@ -646,11 +668,11 @@ async function scrapeWithRetry(url, longDesc, retries = 3) {
       
       if (i === retries) {
         await closeBrowser();
-        throw e;
+        throw new Error(`All scraping attempts failed: ${e.message}`);
       }
       
       // Exponential backoff for retries
-      const delay = 4000 * i;
+      const delay = 5000 * i;
       console.error(`Waiting ${delay}ms before retry...`);
       await sleep(delay);
     }
