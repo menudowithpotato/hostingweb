@@ -5,7 +5,7 @@ puppeteer.use(StealthPlugin());
 
 let browser;
 let pagePool = [];
-const MAX_POOL_SIZE = 6;
+const MAX_POOL_SIZE = 10;
 
 /* =========================
    BROWSER SINGLETON WITH PAGE POOL
@@ -166,8 +166,8 @@ function getRandomUserAgent() {
 
 async function setupPage(page) {
   await page.setUserAgent(getRandomUserAgent());
-  await page.setDefaultNavigationTimeout(25000);
-  await page.setDefaultTimeout(25000);
+  await page.setDefaultNavigationTimeout(20000);
+  await page.setDefaultTimeout(20000);
   await setupRequestInterception(page);
   
   await page.setViewport({ width: 1920, height: 1080 });
@@ -383,9 +383,9 @@ async function run(url, longDesc) {
 
     try {
         console.error("Loading main page...");
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
         
-        await sleep(800);
+        await sleep(500);
         
         const hasContent = await detectBlocks(page);
         if (!hasContent) {
@@ -551,10 +551,10 @@ async function run(url, longDesc) {
             try {
                 await p.goto(`https://www.amazon.com/dp/${v.asin}`, { 
                     waitUntil: "domcontentloaded", 
-                    timeout: 20000 
+                    timeout: 15000 
                 });
 
-                await sleep(600);
+                await sleep(400);
 
                 const hasContent = await detectBlocks(p);
                 if (!hasContent) {
@@ -618,8 +618,8 @@ async function run(url, longDesc) {
             }
         };
 
-        // PARALLEL PROCESSING WITH HIGHER CONCURRENCY
-        const BATCH_SIZE = 5;
+        // PARALLEL PROCESSING WITH HIGH CONCURRENCY
+        const BATCH_SIZE = 8;
         for (let i = 0; i < data.allVariants.length; i += BATCH_SIZE) {
             const batch = data.allVariants.slice(i, i + BATCH_SIZE);
             const batchResults = await Promise.all(batch.map(checkVariant));
@@ -640,7 +640,7 @@ async function run(url, longDesc) {
             });
             
             if (i + BATCH_SIZE < data.allVariants.length) {
-                await sleep(500 + Math.random() * 300);
+                await sleep(300 + Math.random() * 200);
             }
         }
 
