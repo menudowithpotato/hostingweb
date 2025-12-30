@@ -5,7 +5,7 @@ puppeteer.use(StealthPlugin());
 
 let browser;
 let pagePool = [];
-const MAX_POOL_SIZE = 3;
+const MAX_POOL_SIZE = 6;
 
 /* =========================
    BROWSER SINGLETON WITH PAGE POOL
@@ -23,7 +23,23 @@ async function getBrowser() {
       "--disable-blink-features=AutomationControlled",
       "--window-size=1920,1080",
       "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process"
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-breakpad",
+      "--disable-component-extensions-with-background-pages",
+      "--disable-extensions",
+      "--disable-features=TranslateUI",
+      "--disable-ipc-flooding-protection",
+      "--disable-renderer-backgrounding",
+      "--enable-features=NetworkService,NetworkServiceInProcess",
+      "--force-color-profile=srgb",
+      "--hide-scrollbars",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--no-default-browser-check",
+      "--no-first-run"
     ]
   });
 
@@ -43,7 +59,7 @@ async function getPageFromPool() {
 async function returnPageToPool(page) {
   if (pagePool.length < MAX_POOL_SIZE) {
     try {
-      await page.goto('about:blank');
+      await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 5000 });
       pagePool.push(page);
     } catch {
       try { await page.close(); } catch {}
@@ -150,11 +166,10 @@ function getRandomUserAgent() {
 
 async function setupPage(page) {
   await page.setUserAgent(getRandomUserAgent());
-  await page.setDefaultNavigationTimeout(30000);
-  await page.setDefaultTimeout(30000);
+  await page.setDefaultNavigationTimeout(25000);
+  await page.setDefaultTimeout(25000);
   await setupRequestInterception(page);
   
-  // Optimize page performance
   await page.setViewport({ width: 1920, height: 1080 });
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -169,7 +184,9 @@ function extractPackQty(text) {
         /(\d+)\s*[-]?\s*count/i,
         /(\d+)\s*[-]?\s*ct\b/i,
         /(\d+)\s*[-]?\s*pk\b/i,
-        /,\s*(\d+)\s*(?:pack|count|ct|pk)/i
+        /,\s*(\d+)\s*(?:pack|count|ct|pk)/i,
+        /\((\d+)\s*(?:pack|count|ct|pk)\)/i,
+        /(\d+)\s*(?:pack|count|ct|pk)\s*\)/i
     ];
     for (const p of patterns) {
         const m = text.match(p);
@@ -366,10 +383,9 @@ async function run(url, longDesc) {
 
     try {
         console.error("Loading main page...");
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
         
-        // Shorter wait - just enough for content
-        await sleep(1500);
+        await sleep(800);
         
         const hasContent = await detectBlocks(page);
         if (!hasContent) {
@@ -383,6 +399,7 @@ async function run(url, longDesc) {
             const allVariants = [];
             const seen = new Set();
 
+            // Gather from visible variant buttons
             document.querySelectorAll("li[data-defaultasin]").forEach(li => {
                 const asin = li.getAttribute("data-defaultasin");
                 const label = li.textContent?.trim() || li.getAttribute("title") || "";
@@ -401,8 +418,11 @@ async function run(url, longDesc) {
                 }
             });
 
+            // Extract from scripts - comprehensive search
             document.querySelectorAll("script").forEach(s => {
                 const text = s.textContent || "";
+                
+                // dimensionValuesDisplayData
                 const dvMatch = text.match(/dimensionValuesDisplayData[^{]*(\{[^}]+\})/);
                 if (dvMatch) {
                     const asins = dvMatch[1].match(/[A-Z0-9]{10}/g) || [];
@@ -413,6 +433,8 @@ async function run(url, longDesc) {
                         }
                     });
                 }
+                
+                // asinVariationValues
                 const avMatch = text.match(/asinVariationValues[^{]*(\{[^}]+\})/);
                 if (avMatch) {
                     const asins = avMatch[1].match(/[A-Z0-9]{10}/g) || [];
@@ -420,6 +442,54 @@ async function run(url, longDesc) {
                         if (!seen.has(asin)) {
                             seen.add(asin);
                             allVariants.push({ asin, label: "from script" });
+                        }
+                    });
+                }
+                
+                // variationValues - catch more pack variations
+                const vvMatch = text.match(/variationValues[^{]*(\{[^}]+\})/);
+                if (vvMatch) {
+                    const asins = vvMatch[1].match(/[A-Z0-9]{10}/g) || [];
+                    asins.forEach(asin => {
+                        if (!seen.has(asin)) {
+                            seen.add(asin);
+                            allVariants.push({ asin, label: "from variationValues" });
+                        }
+                    });
+                }
+                
+                // twisterData
+                const tdMatch = text.match(/twisterData[^{]*(\{[\s\S]{0,5000}\})/);
+                if (tdMatch) {
+                    const asins = tdMatch[1].match(/[A-Z0-9]{10}/g) || [];
+                    asins.forEach(asin => {
+                        if (!seen.has(asin)) {
+                            seen.add(asin);
+                            allVariants.push({ asin, label: "from twisterData" });
+                        }
+                    });
+                }
+                
+                // dimensionToAsinMap
+                const daMatch = text.match(/dimensionToAsinMap[^{]*(\{[\s\S]{0,3000}\})/);
+                if (daMatch) {
+                    const asins = daMatch[1].match(/[A-Z0-9]{10}/g) || [];
+                    asins.forEach(asin => {
+                        if (!seen.has(asin)) {
+                            seen.add(asin);
+                            allVariants.push({ asin, label: "from dimensionMap" });
+                        }
+                    });
+                }
+                
+                // Generic ASIN pattern in data structures
+                const genericMatch = text.match(/"asin"\s*:\s*"([A-Z0-9]{10})"/g);
+                if (genericMatch) {
+                    genericMatch.forEach(m => {
+                        const asin = m.match(/([A-Z0-9]{10})/)?.[1];
+                        if (asin && !seen.has(asin)) {
+                            seen.add(asin);
+                            allVariants.push({ asin, label: "from generic data" });
                         }
                     });
                 }
@@ -458,17 +528,18 @@ async function run(url, longDesc) {
             return "";
         });
 
+        const mainPackQty = extractPackQty(data.mainTitle) || 1;
         results.push({
             asin: data.mainAsin,
             title: data.mainTitle,
             shade: mainShade,
             url: "https://www.amazon.com/dp/" + data.mainAsin,
-            packQty: extractPackQty(data.mainTitle) || 1,
+            packQty: mainPackQty,
             isMain: true,
             notes: "Main product"
         });
 
-        console.error(`Main: ${data.mainAsin} | Shade: ${mainShade}`);
+        console.error(`Main: ${data.mainAsin} | Shade: ${mainShade} | Pack: ${mainPackQty}`);
         console.error(`Found ${data.allVariants.length} potential variants to check`);
 
         const checkVariant = async (v) => {
@@ -480,10 +551,10 @@ async function run(url, longDesc) {
             try {
                 await p.goto(`https://www.amazon.com/dp/${v.asin}`, { 
                     waitUntil: "domcontentloaded", 
-                    timeout: 25000 
+                    timeout: 20000 
                 });
 
-                await sleep(1000);
+                await sleep(600);
 
                 const hasContent = await detectBlocks(p);
                 if (!hasContent) {
@@ -547,8 +618,8 @@ async function run(url, longDesc) {
             }
         };
 
-        // PARALLEL PROCESSING WITH CONCURRENCY LIMIT
-        const BATCH_SIZE = 3;
+        // PARALLEL PROCESSING WITH HIGHER CONCURRENCY
+        const BATCH_SIZE = 5;
         for (let i = 0; i < data.allVariants.length; i += BATCH_SIZE) {
             const batch = data.allVariants.slice(i, i + BATCH_SIZE);
             const batchResults = await Promise.all(batch.map(checkVariant));
@@ -564,13 +635,12 @@ async function run(url, longDesc) {
                         isMain: false,
                         notes: "Variant"
                     });
-                    console.error(`  ✓ Added: ${r.asin} - Shade: ${r.shade}`);
+                    console.error(`  ✓ Added: ${r.asin} - Shade: ${r.shade} - Pack: ${r.packQty}`);
                 }
             });
             
-            // Shorter delay between batches
             if (i + BATCH_SIZE < data.allVariants.length) {
-                await sleep(800 + Math.random() * 400); // 0.8-1.2 seconds
+                await sleep(500 + Math.random() * 300);
             }
         }
 
@@ -586,7 +656,17 @@ async function run(url, longDesc) {
         }
 
         uniqueResults.sort((a, b) => a.packQty - b.packQty);
-        console.error(`\nDone! Found ${uniqueResults.length} unique products`);
+        
+        console.error(`\n📦 Pack Summary:`);
+        const packCounts = {};
+        uniqueResults.forEach(r => {
+            packCounts[r.packQty] = (packCounts[r.packQty] || 0) + 1;
+        });
+        Object.entries(packCounts).sort((a, b) => Number(a[0]) - Number(b[0])).forEach(([pack, count]) => {
+            console.error(`  ${pack}-pack: ${count} variant(s)`);
+        });
+        
+        console.error(`\n✅ Done! Found ${uniqueResults.length} unique products across all pack sizes`);
         return uniqueResults;
 
     } catch (err) {
@@ -612,7 +692,7 @@ async function scrapeWithRetry(url, longDesc, retries = 3) {
         throw new Error(`All scraping attempts failed: ${e.message}`);
       }
       
-      const delay = 4000 * i;
+      const delay = 3000 * i;
       console.error(`Waiting ${delay}ms before retry...`);
       await sleep(delay);
     }
